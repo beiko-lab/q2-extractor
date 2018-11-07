@@ -2,3 +2,5 @@
 
 .. moduleauthor:: Michael Hall <mike.hall@dal.ca>
 """
+
+from q2_extractor import Extractor, MetaHCRExtractor
