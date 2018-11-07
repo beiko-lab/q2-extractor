@@ -101,13 +101,7 @@ class q2Extractor(object):
             xf = self.zfile.open(data_file)
             principal_coords = pd.read_csv(xf, sep="\t", skiprows=9, 
                                            nrows=nsamples, header=None, index_col=0)
-            prop_explained.rename(columns = dict(zip(prop_explained.columns.values, 
-                                            principal_coords.index.values)),
-                                  inplace = True)
             prop_explained.rename(index={0:"Proportion explained"}, inplace=True)
-            eigvals.rename(columns = dict(zip(eigvals.columns.values, 
-                                              principal_coords.index.values)),
-                           inplace = True)
             eigvals.rename(index={0:"Eigenvalues"}, inplace=True)
             return {'eigenvalues': eigvals, 'proportion_explained': prop_explained, 
                     'coordinates': principal_coords}
