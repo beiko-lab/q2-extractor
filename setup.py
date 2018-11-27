@@ -166,7 +166,7 @@ setup(
     #
     # For example, the following would provide a command called `sample` which
     # executes the function `main` from this package when invoked:
-    entry_points={  # Optional
+    entry_points={'console_scripts': ['q2_extractor=q2_extractor.q2_extractor:main'],  # Optional
     },
 
     # List additional URLs that are relevant to your project as a dict.

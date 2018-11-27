@@ -1,6 +1,6 @@
 import os
 
-from Extractor import q2Extractor
+from q2_extractor.Extractor import q2Extractor
 
 class DirectoryInspector(object):
     """This class takes in a directory and outputs information on the operations
