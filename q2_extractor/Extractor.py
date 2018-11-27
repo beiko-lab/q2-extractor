@@ -18,13 +18,21 @@ yaml.add_constructor('!cite', scalar_constructor)
 yaml.add_constructor('!metadata', scalar_constructor)
 
 def base_uuid(filename):
-    regex = re.compile("[0-9a-fA-F]{8}\-[0-9a-fA-F]{4}\-[0-9a-fA-F]{4}\-[0-9a-fA-F]{4}\-[0-9a-fA-F]{12}")
+    regex = re.compile("[0-9a-fA-F]{8}\-[0-9a-fA-F]{4}\-[0-9a-fA-F]{4}\-" \
+                       "[0-9a-fA-F]{4}\-[0-9a-fA-F]{12}")
     return regex.match(filename)[0]
 
 class q2Extractor(object):
     """This class attempts to extract the useful information
     from a QIIME2 artifact file.
     """
+    # Types covered:
+    #  SampleData[Dada2Stats]
+    #  FeatureTable[Frequency]
+    #  FeatureTable[Taxonomy]
+    #  PCoAResults
+    # Types needed:
+    #  
     def __init__(self, artifact_path):
         """
         """
@@ -44,16 +52,50 @@ class q2Extractor(object):
         xf = self.zfile.open(self.base_uuid + "/provenance/action/action.yaml")
         yf = yaml.load(xf)
         self.action_type = yf['action']['type']
-        if (self.action_type == 'method') | (self.action_type == 'pipeline'):
+        if self.action_type in ['method', 'pipeline', 'visualizer']:
             self.plugin = yf['action']['plugin']
             self.action = yf['action']['action']
             self.parameters = yf['action']['parameters']
             self.inputs = yf['action']['inputs']
             self.plugin_versions = yf['environment']['plugins']
+        elif self.action_type == 'import':
+            self.format = yf['action']['format']
+            self.action = 'import'
+            self.plugin = 'qiime2'
+            self.parameters = {}
+            self.plugin_versions = yf['environment']['plugins']
         else:
             raise NotImplementedError("Action type '%s' not recognized." % (self.action_type,))
+        #We can either get the input output info from transformers
+        if 'transformers' in yf:
+            if self.action_type in ['method', 'pipeline']:
+                self.transforms = yf['transformers'] #autobots, roll out
+                self.inputs = self.transforms['inputs']
+                self.output = self.transforms['output']
+            elif self.action_type == 'visualizer':
+                self.transforms = yf['transformers']
+                self.inputs = self.transforms['inputs']
+                self.output = [{ 'to': yf['transformers']['inputs'][x][0]['to']} for x in yf['transformers']['inputs'] ]
+            elif self.action_type == 'import':
+                self.output = [{ 'to': yf['transformers']['output'][0]['to']}]
+                self.inputs = {'import':[{'from':self.format}]}
+        #Or if they aren't present (as occurs in pipelines), 
+        #we have to go to metadata.yaml for outputs, and translate inputs
+        else:
+            self.inputs = {}
+            for indict in yf['action']['inputs']:
+                for item, uuid in indict.items():
+                    if uuid is not None:
+                        fmat = self.get_format_by_uuid(uuid)
+                        self.inputs[item] = [{'from': fmat}]
+                self.output = [{ 'to': yf['action']['output-name'] }]
         self.env = yf['environment']
-        
+
+    def get_format_by_uuid(self, uuid):
+        xf = self.zfile.open(self.base_uuid + "/provenance/artifacts/" + uuid + "/metadata.yaml")
+        yf = yaml.load(xf)
+        return yf['format']
+
     def extract_data(self):
         #Defines the functions for each QIIME artifact type, and outputs a Python object
         if self.type == 'SampleData[DADA2Stats]':
