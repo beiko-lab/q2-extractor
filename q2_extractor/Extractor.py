@@ -22,6 +22,9 @@ def base_uuid(filename):
                        "[0-9a-fA-F]{4}\-[0-9a-fA-F]{12}")
     return regex.match(filename)[0]
 
+#def artifact_uuid(filename):
+#    regex = re.
+
 class q2Extractor(object):
     """This class attempts to extract the useful information
     from a QIIME2 artifact file.
@@ -40,17 +43,16 @@ class q2Extractor(object):
         self.zfile = zipfile.ZipFile(artifact_path)
         self.infolist = self.zfile.infolist()
         self.base_uuid = base_uuid(self.infolist[0].filename)
-        
         #First, hit up the lowest-level metadata.yaml
         xf = self.zfile.open(self.base_uuid + "/metadata.yaml")
-        yf = yaml.load(xf)
+        yf = yaml.load(xf, Loader=yaml.Loader)
         self.type = yf['type']
         self.format = yf['format']
         
         #Next, hit up the action.yaml in the provenance folder
         #This is the provenance of THIS item
         xf = self.zfile.open(self.base_uuid + "/provenance/action/action.yaml")
-        yf = yaml.load(xf)
+        yf = yaml.load(xf, Loader=yaml.Loader)
         self.action_type = yf['action']['type']
         if self.action_type in ['method', 'pipeline', 'visualizer']:
             self.plugin = yf['action']['plugin']
@@ -91,6 +93,33 @@ class q2Extractor(object):
                 self.output = [{ 'to': yf['action']['output-name'] }]
         self.env = yf['environment']
 
+    def get_provenance(self):
+        provenance_actions = []
+        for fname in self.infolist:
+            regex = re.compile("[0-9a-fA-F]{8}\-[0-9a-fA-F]{4}\-[0-9a-fA-F]{4}\-" \
+                               "[0-9a-fA-F]{4}\-[0-9a-fA-F]{12}/action/action.yaml")
+            matches = regex.findall(fname.filename)
+            if len(matches) >= 1:
+                provenance_actions.append(matches[0])
+        
+        plugin_str = "pipeline_step_id\tpipeline_step_action\tpipeline_step_parameter_id\tpipeline_step_parameter_value\n"
+        file_str = "filename\tmd5sum\n"
+        for actionyaml in provenance_actions:
+            xf = self.zfile.open(self.base_uuid + "/provenance/artifacts/" + actionyaml)
+            yf = yaml.load(xf, Loader=yaml.Loader)
+            if 'plugin' in yf['action']:
+                parameters = [list(x.items())[0] for x in yf['action']['parameters']]
+                plugin_name = yf['action']['plugin'].split(":")[-1]
+                action = yf['action']['action']
+                for key, value in parameters:
+                    plugin_str += "%s\t%s\t%s\t%s\n" % (plugin_name, action, key, value)
+            #It is import item, so we grab the manifest
+            else:
+                fname_md5sums = yf['action']['manifest']
+                for x in fname_md5sums:
+                    file_str+= "%s\t%s\n" % (x['name'], x['md5sum'])
+        return plugin_str, file_str
+
     def get_format_by_uuid(self, uuid):
         xf = self.zfile.open(self.base_uuid + "/provenance/artifacts/" + uuid + "/metadata.yaml")
         yf = yaml.load(xf)
@@ -127,8 +156,8 @@ class q2Extractor(object):
             tf = pd.read_csv(xf, sep="\t")
             return tf
         elif self.type == 'PCoAResults':
-	    #This file is the dumbest to parse
-	    #It's a bunch of tables stacked on top of one another in ASCII
+            #This file is the dumbest to parse
+            #It's a bunch of tables stacked on top of one another in ASCII
             data_file = self.base_uuid + "/data/ordination.txt"
             xf = self.zfile.open(data_file)
             nsamples = pd.read_csv(xf, sep="\t", skiprows=0, 
@@ -147,6 +176,12 @@ class q2Extractor(object):
             eigvals.rename(index={0:"Eigenvalues"}, inplace=True)
             return {'eigenvalues': eigvals, 'proportion_explained': prop_explained, 
                     'coordinates': principal_coords}
+        elif self.type == 'Phylogeny[Rooted]':
+            import ete3
+            data_file = self.base_uuid + "/data/tree.nwk"
+            xf = self.zfile.open(data_file)
+            tree = ete3.Tree(xf.read().decode(), format=1)
+            return tree
         else:
             raise NotImplementedError("Type '%s' not yet implemented." % (self.type,))
             

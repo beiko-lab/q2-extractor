@@ -28,25 +28,33 @@ class DirectoryInspector(object):
                     self.action_output[ext.action].extend(ext.output)
                     self.action_inputs[ext.action].update(ext.inputs)
 
-    def print_pipeline(self):
-        print("name\tinput_types\toutput_types\tparameters")
+    def get_pipeline(self, name="New QIIME2 Pipeline"):
+        out_str = ""
+        out_str += "pipeline_id\tpipeline_step_id\tpipeline_step_action\tpipeline_step_parameter_id\tpipeline_step_parameter_value\n"
         for action in self.actions:
-            for plugin in self.actions[action]: 
+            for plugin in self.actions[action]:
+                plugin_name = plugin.split(":")[-1]
+                parameters = []
                 parameters = self.actions[action][plugin]
-                param_str = ",".join([[":".join([x,str(d[x])]) for x in d ][0] \
-                                          for d in parameters ])
-                plugin = plugin.split(":")[-1]
-                name = plugin + "__" + action
                 input_str = ",".join([
                     self.action_inputs[action][in_name][0]['from'] \
                             for in_name in self.action_inputs[action]
                     ])
                 output_str = ",".join([x["to"] \
                            for x in self.action_output[action]])
-                print("%s\t%s\t%s\t%s" % (name,
-                                          input_str,
-                                          output_str,
-                                          param_str))
+                if len(parameters) == 0:
+                    out_str += "%s\t%s\t%s\t\t\n" % (name,
+                                                     plugin_name,
+                                                     action)
+                for parameter in parameters:
+                    for key, value in parameter.items():
+                        param_str = ""
+                        out_str += "%s\t%s\t%s\t%s\t%s\n" % (name,
+                                                             plugin_name, 
+                                                             action,
+                                                             key,
+                                                             value)
+        return out_str
 
             
 
