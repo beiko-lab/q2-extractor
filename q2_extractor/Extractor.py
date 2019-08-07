@@ -1,6 +1,7 @@
 import zipfile
 import yaml
 import re
+import io
 import pandas as pd
 from scipy.sparse import csr_matrix
 import h5py as h5
@@ -21,9 +22,6 @@ def base_uuid(filename):
     regex = re.compile("[0-9a-fA-F]{8}\-[0-9a-fA-F]{4}\-[0-9a-fA-F]{4}\-" \
                        "[0-9a-fA-F]{4}\-[0-9a-fA-F]{12}")
     return regex.match(filename)[0]
-
-#def artifact_uuid(filename):
-#    regex = re.
 
 class q2Extractor(object):
     """This class attempts to extract the useful information
@@ -103,7 +101,7 @@ class q2Extractor(object):
                 provenance_actions.append(matches[0])
         
         plugin_str = "pipeline_step_id\tpipeline_step_action\tpipeline_step_parameter_id\tpipeline_step_parameter_value\n"
-        file_str = "filename\tmd5sum\n"
+        file_str = "replicate_name\tfilename\tmd5sum\n"
         for actionyaml in provenance_actions:
             xf = self.zfile.open(self.base_uuid + "/provenance/artifacts/" + actionyaml)
             yf = yaml.load(xf, Loader=yaml.Loader)
@@ -117,12 +115,21 @@ class q2Extractor(object):
             else:
                 fname_md5sums = yf['action']['manifest']
                 for x in fname_md5sums:
-                    file_str+= "%s\t%s\n" % (x['name'], x['md5sum'])
+                    file_str+= "%s\t%s\t%s\n" % (x['name'].split("_")[0] if ".fastq.gz" in x['name'] else "NA", 
+                                                 x['name'], 
+                                                 x['md5sum'])
         return plugin_str, file_str
+
+    #Return the names of the replicates (i.e., fastq.gz filenames) involved in creating the artifact
+    def get_replicates(self):
+        file_prov = self.get_provenance()[1]
+        return pd.unique(
+                pd.read_csv(io.StringIO(self.get_provenance()[1]), 
+                            sep="\t")["replicate_name"].dropna()).tolist()
 
     def get_format_by_uuid(self, uuid):
         xf = self.zfile.open(self.base_uuid + "/provenance/artifacts/" + uuid + "/metadata.yaml")
-        yf = yaml.load(xf)
+        yf = yaml.load(xf, Loader=yaml.Loader)
         return yf['format']
 
     def extract_data(self):
@@ -184,7 +191,60 @@ class q2Extractor(object):
             return tree
         else:
             raise NotImplementedError("Type '%s' not yet implemented." % (self.type,))
-            
+    
+    def extract_measures(self):
+        #Extracts measures in format (name, description, type, value, target, target_names)
+        if self.type == 'SampleData[DADA2Stats]':
+            pass
+        elif self.type == 'PCoAResults':
+            pass
+        elif self.type == 'FeatureTable[Frequency]':
+            data = []
+            table_data = self.extract_data()
+            feature_names = table_data.index.tolist()
+            replicate_names = table_data.columns.tolist()
+            rep_abundances = table_data.sum()
+            feature_abundances = table_data.sum(axis=1)
+            total_sequences = table_data.sum().sum()
+            data = [('total_sequences', 
+                      "Total sequences from a Feature Table", 
+                      "Int", 
+                      total_sequences, 
+                      "BiologicalReplicate", 
+                      self.get_replicates())]
+            data.extend([('replicate_abundance',
+                     "Total abundance for a replicate",
+                     "Int",
+                     abundance,
+                     "BiologicalReplicate",
+                     [rep_name]) for rep_name, abundance in rep_abundances.iteritems()])
+            data.extend([('feature_abundance',
+                    "Total abundance for a feature",
+                    "Int",
+                    abundance,
+                    "Feature",
+                    [feat_name]) for feat_name, abundance in feature_abundances.iteritems()])
+            [data.extend([('feature_sample_abundance', 
+                       "Abundance of a feature in a replicate",
+                       "Int",
+                       table_data.loc[feature, replicate],
+                       "FeatureReplicate",
+                       [(feature, replicate)]) for replicate in replicate_names if table_data.loc[feature, replicate] > 0.0]) for feature in feature_names]
+        elif self.type == 'FeatureData[Taxonomy]':
+            data = []
+            tax_data = self.extract_data()
+            return [("taxonomic_classification", 
+                     "Taxonomic classification of a feature", 
+                     "Str", 
+                     row['Taxon'], 
+                     "Feature",
+                     [row['Feature ID']]) for index, row in tax_data.iterrows()]
+        elif self.type == 'Phylogeny[Rooted]':
+            data = [("newick_string", "Newick string representation of a phylogeny",
+                     "Str", self.extract_data().write(), 
+                     'BiologicalReplicate', self.get_replicates())]
+        return data
+
     def __str__(self):
         o_str = "Artifact: %s\n" % (self.filename,)
         o_str += "Type: %s\n" % (self.type,)
