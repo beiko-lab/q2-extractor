@@ -3,10 +3,12 @@ import yaml
 import re
 import io
 import pandas as pd
+import numpy as np
 from scipy.sparse import csr_matrix
 import h5py as h5
 import tempfile
-from sklearn.preprocessing import normalize
+import copy
+import arrow
 
 def scalar_constructor(loader, node):
     value = loader.construct_scalar(node)
@@ -27,13 +29,6 @@ class q2Extractor(object):
     """This class attempts to extract the useful information
     from a QIIME2 artifact file.
     """
-    # Types covered:
-    #  SampleData[Dada2Stats]
-    #  FeatureTable[Frequency]
-    #  FeatureTable[Taxonomy]
-    #  PCoAResults
-    # Types needed:
-    #  
     def __init__(self, artifact_path):
         """
         """
@@ -46,7 +41,7 @@ class q2Extractor(object):
         yf = yaml.load(xf, Loader=yaml.Loader)
         self.type = yf['type']
         self.format = yf['format']
-        
+        self.value_dict = {}
         #Next, hit up the action.yaml in the provenance folder
         #This is the provenance of THIS item
         xf = self.zfile.open(self.base_uuid + "/provenance/action/action.yaml")
@@ -91,41 +86,159 @@ class q2Extractor(object):
                 self.output = [{ 'to': yf['action']['output-name'] }]
         self.env = yf['environment']
 
-    def get_provenance(self):
-        provenance_actions = []
-        for fname in self.infolist:
-            regex = re.compile("[0-9a-fA-F]{8}\-[0-9a-fA-F]{4}\-[0-9a-fA-F]{4}\-" \
-                               "[0-9a-fA-F]{4}\-[0-9a-fA-F]{12}/action/action.yaml")
-            matches = regex.findall(fname.filename)
-            if len(matches) >= 1:
-                provenance_actions.append(matches[0])
+    def get_provenance(self, current=True, upstream=True, include_input=True):
+        actions = []
+        latest_qiime_year = 2004
+        latest_qiime_month = 1
+        latest_qiime_minor = 0
+        latest_rundate = arrow.Arrow(year=1979,month=1,day=1)
+        if upstream:
+            for fname in self.infolist:
+                regex = re.compile("[0-9a-fA-F]{8}\-[0-9a-fA-F]{4}\-[0-9a-fA-F]{4}\-" \
+                                   "[0-9a-fA-F]{4}\-[0-9a-fA-F]{12}/action/action.yaml")
+                matches = regex.findall(fname.filename)
+                if len(matches) >= 1:
+                    actions.append("artifacts/" + matches[0])
         
-        plugin_str = "pipeline_step_id\tpipeline_step_action\tpipeline_step_parameter_id\tpipeline_step_parameter_value\n"
-        file_str = "replicate_name\tfilename\tmd5sum\n"
-        for actionyaml in provenance_actions:
-            xf = self.zfile.open(self.base_uuid + "/provenance/artifacts/" + actionyaml)
+        file_str = "sample_id\tvalue_type\tsequence_filename\tsequence_md5sum\n"
+        if current:
+            actions = actions + ["action/action.yaml"]
+        samples = []
+        result_stream = {}
+        for actionyaml in actions:
+            if actionyaml != "action/action.yaml":
+                xf = self.zfile.open(self.base_uuid + "/provenance/artifacts/" + actionyaml.split("/")[1] + "/metadata.yaml")
+                yf = yaml.load(xf, Loader=yaml.Loader)
+                result_type = yf['type']
+                result_format = yf['format']
+            else:
+                result_type = self.type
+                result_format = self.format
+            xf = self.zfile.open(self.base_uuid + "/provenance/" + actionyaml)
             yf = yaml.load(xf, Loader=yaml.Loader)
+            rundate = yf['execution']['runtime']['start']
+            rundate = arrow.get(rundate)
+            if rundate > latest_rundate:
+                latest_rundate = rundate
+            if "version" in yf["environment"]["framework"]:
+                qiime_version = yf['environment']['framework']['version']
+                if latest_qiime_year < int(qiime_version.split(".")[0]):
+                    latest_qiime_year = int(qiime_version.split(".")[0])
+                if latest_qiime_month < int(qiime_version.split(".")[1]):
+                    latest_qiime_month = int(qiime_version.split(".")[1])
+                if latest_qiime_minor < int(qiime_version.split(".")[2]):
+                    latest_qiime_minor = int(qiime_version.split(".")[2])
+            res_uuid = actionyaml.split("/")[1]
+            if res_uuid == "action.yaml":
+                res_uuid = self.base_uuid
             if 'plugin' in yf['action']:
                 parameters = [list(x.items())[0] for x in yf['action']['parameters']]
+                inputs = [list(x.items())[0] for x in yf['action']['inputs']]
+                inputs = [(x, y) for x,y in inputs if y is not None]
                 plugin_name = yf['action']['plugin'].split(":")[-1]
                 action = yf['action']['action']
+                step = plugin_name + "__" + action 
+                if res_uuid not in result_stream:
+                    result_stream[res_uuid] = {"step_id": step}
                 for key, value in parameters:
-                    plugin_str += "%s\t%s\t%s\t%s\n" % (plugin_name, action, key, value)
+                    if key not in result_stream[res_uuid]:
+                        result_stream[res_uuid][key] = [value]
+                    else:
+                        result_stream[res_uuid][key].append(value)
+                for key, value in inputs:
+                    if include_input:
+                        if "upstream_result" not in result_stream[res_uuid]:
+                            result_stream[res_uuid]["upstream_result"] = [value]
+                        else:
+                            result_stream[res_uuid]["upstream_result"].append(value)
+                        if key not in result_stream[res_uuid]:
+                            result_stream[res_uuid][key] = [value]
+                        else:
+                            result_stream[res_uuid][key].append(value)
+                    else:
+                        #Record the upstream step
+                        upstream_uuid = value
+                        if "upstream_step" not in result_stream[res_uuid]:
+                            result_stream[res_uuid]["upstream_step"] = [upstream_uuid]
+                        else:
+                            result_stream[res_uuid]["upstream_step"].append(upstream_uuid)
             #It is import item, so we grab the manifest
             else:
+                result_stream[res_uuid] = {"step_id": "qiime2_import"}
                 fname_md5sums = yf['action']['manifest']
-                for x in fname_md5sums:
-                    file_str+= "%s\t%s\t%s\n" % (x['name'].split("_")[0] if ".fastq.gz" in x['name'] else "NA", 
-                                                 x['name'], 
-                                                 x['md5sum'])
-        return plugin_str, file_str
+                filenames = [x['name'] for x in fname_md5sums]
+                #If this is a MANIFESTed, import, we can get the sample_ids from it
+                if include_input:
+                    if ("MANIFEST" in filenames) and ("metadata.yml" in filenames):
+                        samples = [x.split("_")[0] for x in filenames if x not in ["MANIFEST","metadata.yml"]]
+                    for x in fname_md5sums:
+                        if "input_filename" not in result_stream[res_uuid]:
+                            result_stream[res_uuid]["input_filename"] = [x['name']]
+                        else:
+                            result_stream[res_uuid]["input_filename"].append(x['name'])
+                        if "input_filename_md5sum" not in result_stream[res_uuid]:
+                            result_stream[res_uuid]["input_filename_md5sum"] = [x['name']+": " + x['md5sum']]
+                        else:
+                            result_stream[res_uuid]["input_filename_md5sum"].append(x['name']+": "+x['md5sum'])
+        
+            result_stream[res_uuid]["result_type"] = [result_type]
+        parameter_names = []
+        for res_uuid in result_stream:
+            if "upstream_step" in result_stream[res_uuid]:
+                upstream_uuids = result_stream[res_uuid]["upstream_step"]
+                upstream_steps = []
+                for upstream_uuid in upstream_uuids:
+                    if (upstream_uuid in result_stream) and \
+                       ("step_id" in result_stream[upstream_uuid]) and \
+                       (result_stream[upstream_uuid]["step_id"] not in upstream_steps):
+                        upstream_steps.append(result_stream[upstream_uuid]["step_id"])
+                result_stream[res_uuid]["upstream_step"] = upstream_steps
 
-    #Return the names of the replicates (i.e., fastq.gz filenames) involved in creating the artifact
-    def get_replicates(self):
-        file_prov = self.get_provenance()[1]
-        return pd.unique(
-                pd.read_csv(io.StringIO(self.get_provenance()[1]), 
-                            sep="\t")["replicate_name"].dropna()).tolist()
+            initial_fields = list(result_stream[res_uuid].keys())
+            for field in initial_fields:
+                # If multiple values, duplicate columns
+                if isinstance(result_stream[res_uuid][field], list):
+                    orig_list = copy.deepcopy(result_stream[res_uuid][field])
+                    for idx, val in enumerate(orig_list):
+                        if idx == 0:
+                            new_field = field
+                        else:
+                            new_field = field + ".%d" % (idx,)
+                        parameter_names.append(new_field)
+                        result_stream[res_uuid][new_field] = val
+                else:
+                    parameter_names.append(field)
+        for res_uuid in result_stream:
+            parameter_names.extend(list(result_stream[res_uuid].keys()))
+        parameter_names = np.unique(parameter_names)
+        plugin_columns = ["analysis_id", "analysis_date", "result_source","value_type", "value_target"] + parameter_names.tolist()
+        plugin_table = pd.DataFrame.from_dict(result_stream, columns=plugin_columns, orient='index')
+        plugin_table.index.name = "result_id"
+        plugin_table.loc[:, "value_type"] = "parameter"
+        if include_input:
+            plugin_table.loc[:, "value_target"] = "result_id"
+        else:
+            plugin_table.loc[:, "value_target"] = "step_id"
+        plugin_table.loc[:, "result_source"] = "qiime2"
+        plugin_table.loc[:, "analysis_id"] = "QIIME2 Run, " + latest_rundate.format("MMMM YYYY") + ", version %d.%d.%d" % (latest_qiime_year, latest_qiime_month, latest_qiime_minor)
+        plugin_table.loc[:, "analysis_date"] = latest_rundate.format("DD/MM/YYYY")
+        for idx, sample in enumerate(samples):
+            if idx == 0:
+                new_field = "sample_id"
+            else:
+                new_field = "sample_id.%d" % (idx,)
+            plugin_table.loc[:, new_field] = sample
+        return plugin_table
+
+    def _add_parameters(self, current=True, upstream=False):
+        if len(self.value_dict) == 0:
+            self._init_value_table()
+        plugin_str, file_str = self.get_provenance(current, upstream)
+        param_table = pd.read_csv(io.StringIO(plugin_str), sep="\t")
+        self._add_value([ (param_table.loc[x]["step_parameter_id"],
+                           param_table.loc[x]["step_parameter_value"]) for x in param_table.index ],
+                        value_type="PA")
+                            
 
     def get_format_by_uuid(self, uuid):
         xf = self.zfile.open(self.base_uuid + "/provenance/artifacts/" + uuid + "/metadata.yaml")
@@ -133,6 +246,7 @@ class q2Extractor(object):
         return yf['format']
 
     def extract_data(self):
+        #TODO: Subclass this out into a TypeParser or something for better organization
         #Defines the functions for each QIIME artifact type, and outputs a Python object
         if self.type == 'SampleData[DADA2Stats]':
             #Output: pandas DataFrame
@@ -191,59 +305,97 @@ class q2Extractor(object):
             return tree
         else:
             raise NotImplementedError("Type '%s' not yet implemented." % (self.type,))
-    
-    def extract_measures(self):
-        #Extracts measures in format (name, description, type, value, target, target_names)
+   
+    def _init_value_table(self):
+        # Globally true settings for all artifacts
+        global_settings = {"result_id": self.base_uuid,
+                           "result_type": self.type,
+                           "source_step_id": self.plugin,
+                           "source_step_method": self.action,
+                           "source_software": "qiime2",
+                           "replicate_id": np.nan,
+                           "feature_id": np.nan,
+                           "value_type": np.nan}
+        self.value_dict = {0: global_settings}
+        self.valtab_index = 1
+
+    def _add_value(self, values, link_objs=[], value_type="ME"):
+        #Duplicate the rows above
+        self.value_dict[self.valtab_index] = copy.deepcopy(self.value_dict[0])
+        for value_name, value in values:
+            self.value_dict[self.valtab_index][value_name] = value
+        for field_info in link_objs:
+            field_name = field_info[0]
+            suffidx = 1
+            if not pd.isna(self.value_dict[self.valtab_index][field_name]):
+                while (field_name in self.value_dict[self.valtab_index]):
+                    field_name = field_info[0] + ".%d" % (suffidx,)
+                    suffidx += 1
+            self.value_dict[self.valtab_index][field_name] = field_info[1]
+        self.value_dict[self.valtab_index]["value_type"] = value_type
+        self.valtab_index += 1
+
+    def extract_values(self):
+        self._init_value_table()
+               # We need to add replicate ID and 
         if self.type == 'SampleData[DADA2Stats]':
-            pass
+            data = self.extract_data()
+            for row in data.index:
+                rep = data.loc[row]['sample-id']
+                index_names = ["input", "filtered","denoised","merged","non-chimeric"]
+                value_names = ["input_sequence_count", "filtered_sequence_count", "denoised_sequence_count", "merged_sequence_count", "nonchimeric_sequence_count"]
+                values = [data.loc[row][name] for name in index_names]
+                self._add_value(zip(value_names, values),
+                                [("replicate_id", rep)])
         elif self.type == 'PCoAResults':
-            pass
+            data = self.extract_data()
+            coords = data['coordinates']
+            prop_exp = data['proportion_explained']
+            # Set this to be variable?
+            for x in coords.index:
+                self._add_value([("pcoa_coord_%d" % (pc,), coords.loc[x][pc]) for pc in [1,2,3]],
+                                [("replicate_id", x)])
+            self._add_value([("proportion_explained_pcoa_%d" % (pc,), prop_exp.loc["Proportion explained"][pc]) for pc in [1,2,3]])
         elif self.type == 'FeatureTable[Frequency]':
-            data = []
             table_data = self.extract_data()
             feature_names = table_data.index.tolist()
             replicate_names = table_data.columns.tolist()
             rep_abundances = table_data.sum()
             feature_abundances = table_data.sum(axis=1)
             total_sequences = table_data.sum().sum()
-            data = [('total_sequences', 
-                      "Total sequences from a Feature Table", 
-                      "Int", 
-                      total_sequences, 
-                      "BiologicalReplicate", 
-                      self.get_replicates())]
-            data.extend([('replicate_abundance',
-                     "Total abundance for a replicate",
-                     "Int",
-                     abundance,
-                     "BiologicalReplicate",
-                     [rep_name]) for rep_name, abundance in rep_abundances.iteritems()])
-            data.extend([('feature_abundance',
-                    "Total abundance for a feature",
-                    "Int",
-                    abundance,
-                    "Feature",
-                    [feat_name]) for feat_name, abundance in feature_abundances.iteritems()])
-            [data.extend([('feature_sample_abundance', 
-                       "Abundance of a feature in a replicate",
-                       "Int",
-                       table_data.loc[feature, replicate],
-                       "FeatureReplicate",
-                       [(feature, replicate)]) for replicate in replicate_names if table_data.loc[feature, replicate] > 0.0]) for feature in feature_names]
+            self._add_value([("table_sequence_count",
+                            total_sequences)])
+            for rep, abund in zip(replicate_names, rep_abundances):
+                self._add_value([("replicate_sequence_count",abund)],
+                                [("replicate_id", rep)])
+            for feat, abund in zip(feature_names, feature_abundances):
+                self._add_value([("feature_sequence_count",
+                                abund)],
+                                [("feature_id", feat)])
+            for rep in replicate_names:
+                for feat in feature_names:
+                    abund = table_data.loc[feat][rep]
+                    if (abund > 0):
+                        self._add_value([("feature_replicate_count",
+                                    table_data.loc[feat][rep])],
+                                    [("feature_id", feat),
+                                     ("replicate_id", rep)])
         elif self.type == 'FeatureData[Taxonomy]':
             data = []
             tax_data = self.extract_data()
-            return [("taxonomic_classification", 
-                     "Taxonomic classification of a feature", 
-                     "Str", 
-                     row['Taxon'], 
-                     "Feature",
-                     [row['Feature ID']]) for index, row in tax_data.iterrows()]
+            for index, row in tax_data.iterrows():
+                self._add_value([("taxonomic_classification",
+                                  row['Taxon']),
+                                 ("taxonomic_confidence",
+                                  row['Confidence'])],
+                                [("feature_id",
+                                  row['Feature ID'])])
         elif self.type == 'Phylogeny[Rooted]':
-            data = [("newick_string", "Newick string representation of a phylogeny",
-                     "Str", self.extract_data().write(), 
-                     'BiologicalReplicate', self.get_replicates())]
-        return data
+            data = self.extract_data()
+            self._add_value([("newick_string", data.write())],
+                            [("replicate_id", x) for x in self.get_replicates()] + [("feature_id", x.name) for x in data.get_leaves()])
+        self._add_parameters()
+        return pd.DataFrame.from_dict(self.value_dict, orient='index')
 
     def __str__(self):
         o_str = "Artifact: %s\n" % (self.filename,)

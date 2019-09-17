@@ -1,6 +1,11 @@
 import os
 
 from q2_extractor.Extractor import q2Extractor
+import io
+import numpy as np
+import pandas as pd
+import uuid
+import copy
 
 class DirectoryInspector(object):
     """This class takes in a directory and outputs information on the operations
@@ -10,9 +15,8 @@ class DirectoryInspector(object):
     def __init__(self, path="."):
         path = os.path.abspath(path)
         files = os.listdir(path)
-        self.actions = {}
-        self.action_inputs = {}
-        self.action_output = {}
+        self.values_dict = {}
+        aggregate_table = pd.DataFrame()
         for f in files:
             if f.endswith(".qza") | f.endswith(".qzv"):
                 try:
@@ -20,41 +24,33 @@ class DirectoryInspector(object):
                 except NotImplementedError:
                     print(f)
                     continue
-                if ext.action not in self.actions:
-                    self.actions[ext.action] = {ext.plugin: ext.parameters}
-                    self.action_output[ext.action] = ext.output
-                    self.action_inputs[ext.action] = ext.inputs
-                else:
-                    self.action_output[ext.action].extend(ext.output)
-                    self.action_inputs[ext.action].update(ext.inputs)
+                prov_table = ext.get_provenance(include_input=False)
+                prov_table = prov_table.drop(["result_source", "result_type", "analysis_id", "analysis_date"], axis=1, errors='ignore')
+                aggregate_table = pd.concat([aggregate_table, prov_table], sort=False).drop_duplicates()
+        self.table = aggregate_table.reset_index().drop("result_id", axis=1).drop_duplicates()
+        cols = list(self.table)
+        pop_order = ["value_target", "value_type"] + \
+                    sorted([x for x in cols if "upstream_step" in x], reverse=True) + \
+                    ["step_id"]
+        for item in pop_order:
+            cols.insert(0, cols.pop(cols.index(item)))
+        self.table = self.table.loc[:, cols]
+        self.table = self.table.sort_values(["step_id", "upstream_step"])
 
-    def get_pipeline(self, name="New QIIME2 Pipeline"):
-        out_str = ""
-        out_str += "pipeline_id\tpipeline_step_id\tpipeline_step_action\tpipeline_step_parameter_id\tpipeline_step_parameter_value\n"
-        for action in self.actions:
-            for plugin in self.actions[action]:
-                plugin_name = plugin.split(":")[-1]
-                parameters = []
-                parameters = self.actions[action][plugin]
-                input_str = ",".join([
-                    self.action_inputs[action][in_name][0]['from'] \
-                            for in_name in self.action_inputs[action]
-                    ])
-                output_str = ",".join([x["to"] \
-                           for x in self.action_output[action]])
-                if len(parameters) == 0:
-                    out_str += "%s\t%s\t%s\t\t\n" % (name,
-                                                     plugin_name,
-                                                     action)
-                for parameter in parameters:
-                    for key, value in parameter.items():
-                        param_str = ""
-                        out_str += "%s\t%s\t%s\t%s\t%s\n" % (name,
-                                                             plugin_name, 
-                                                             action,
-                                                             key,
-                                                             value)
-        return out_str
-
-            
+    def get_process(self, name="New QIIME2 Pipeline", description=None):
+        table = self.table
+        table.loc[:,"process_category"] = "qiime2"
+        table.loc[:,"process_id"] = name
+        table.loc[:,"process_citation"] = "@article{bolyen2019reproducible,title={Reproducible, interactive, scalable and extensible microbiome data science using QIIME 2},author={Bolyen, Evan and Rideout, Jai Ram and Dillon, Matthew R and Bokulich, Nicholas A and Abnet, Christian C and Al-Ghalith, Gabriel A and Alexander, Harriet and Alm, Eric J and Arumugam, Manimozhiyan and Asnicar, Francesco and others},journal={Nature biotechnology},volume={37},number={8},pages={852--857},year={2019},publisher={Nature Publishing Group}}"
+        if description:
+            table.loc[:,"process_description"] = description
+        cols = list(table)
+        if description:
+            pop_order = ["process_citation", "process_description", "process_category", "process_id"]
+        else:
+            pop_order = ["process_citation", "process_category", "process_id"]
+        for item in pop_order:
+            cols.insert(0, cols.pop(cols.index(item)))
+        table = table.loc[:, cols]
+        return table
 
