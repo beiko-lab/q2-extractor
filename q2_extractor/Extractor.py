@@ -9,6 +9,9 @@ import h5py as h5
 import tempfile
 import copy
 import arrow
+import importlib
+import inspect
+import pkgutil
 
 def scalar_constructor(loader, node):
     value = loader.construct_scalar(node)
@@ -25,7 +28,64 @@ def base_uuid(filename):
                        "[0-9a-fA-F]{4}\-[0-9a-fA-F]{12}")
     return regex.match(filename)[0]
 
-class q2Extractor(object):
+def get_default_args(plugin_str, func_str):
+    import qiime2
+    pm = qiime2.sdk.PluginManager()
+    if func_str in pm.plugins[plugin_str].methods:
+        params = pm.plugins[plugin_str].methods[func_str].signature.parameters
+        desc = pm.plugins[plugin_str].methods[func_str].description
+    elif func_str in pm.plugins[plugin_str].visualizers:
+        params = pm.plugins[plugin_str].visualizers[func_str].signature.parameters
+        desc = pm.plugins[plugin_str].visualizers[func_str].description
+    elif func_str in pm.plugins[plugin_str].pipelines:
+        params = pm.plugins[plugin_str].pipelines[func_str].signature.parameters
+        desc = pm.plugins[plugin_str].pipelines[func_str].description
+    else:
+        params = {}
+        desc = "No description found"
+    dat = {param: params[param].default for param in params}
+    dat["step_description"] = desc
+    return dat
+
+#Deprecated, but I'm keeping this here just for fun
+def manual_get_default_args(plugin_str, func_str):
+    dat = None
+    plugin_spec = importlib.util.find_spec(plugin_str)
+    if plugin_spec:
+        plugin = importlib.import_module(plugin_str)
+        if "__path__" in vars(plugin):
+            submods = [x[1] for x in pkgutil.iter_modules(plugin.__path__)]
+        else:
+            submods = []
+    else:
+        raise ValueError("Plugin %s not found" % (plugin_str,))
+    if func_str not in vars(plugin):
+        for submod in submods:
+            mod_name = plugin_str + "." + submod
+            mod_spec = importlib.util.find_spec(mod_name)
+            if mod_spec:
+                dat = get_default_args(mod_name, func_str)
+                if dat is not None:
+                    return dat
+    else:
+        try:
+            signature = inspect.signature(getattr(plugin, func_str))
+            dat = {
+                k: v.default
+                for k, v in signature.parameters.items()
+                if v.default is not inspect.Parameter.empty
+            }
+        except:
+            # Try to get it from QIIME2 itself
+            dat = get_default_args_auto(plugin_str, func_str)
+    if dat is None:
+        try:
+            dat = get_default_args_auto(plugin_str, func_str)
+        except:
+            dat = None
+    return dat
+
+class Extractor(object):
     """This class attempts to extract the useful information
     from a QIIME2 artifact file.
     """
@@ -48,7 +108,7 @@ class q2Extractor(object):
         yf = yaml.load(xf, Loader=yaml.Loader)
         self.action_type = yf['action']['type']
         if self.action_type in ['method', 'pipeline', 'visualizer']:
-            self.plugin = yf['action']['plugin']
+            self.plugin = yf['action']['plugin'].split(":")[-1]
             self.action = yf['action']['action']
             self.parameters = yf['action']['parameters']
             self.inputs = yf['action']['inputs']
@@ -85,6 +145,7 @@ class q2Extractor(object):
                         self.inputs[item] = [{'from': fmat}]
                 self.output = [{ 'to': yf['action']['output-name'] }]
         self.env = yf['environment']
+        self.samples = None # Fetch this with get provenance if desired
 
     def get_provenance(self, current=True, upstream=True, include_input=True):
         actions = []
@@ -171,6 +232,7 @@ class q2Extractor(object):
                 if include_input:
                     if ("MANIFEST" in filenames) and ("metadata.yml" in filenames):
                         samples = [x.split("_")[0] for x in filenames if x not in ["MANIFEST","metadata.yml"]]
+                        self.samples = samples
                     for x in fname_md5sums:
                         if "input_filename" not in result_stream[res_uuid]:
                             result_stream[res_uuid]["input_filename"] = [x['name']]
@@ -211,17 +273,19 @@ class q2Extractor(object):
         for res_uuid in result_stream:
             parameter_names.extend(list(result_stream[res_uuid].keys()))
         parameter_names = np.unique(parameter_names)
-        plugin_columns = ["analysis_id", "analysis_date", "result_source","value_type", "value_target"] + parameter_names.tolist()
+        plugin_columns = ["result_source","value_type", "value_target"] + parameter_names.tolist()
         plugin_table = pd.DataFrame.from_dict(result_stream, columns=plugin_columns, orient='index')
         plugin_table.index.name = "result_id"
         plugin_table.loc[:, "value_type"] = "parameter"
         if include_input:
             plugin_table.loc[:, "value_target"] = "result_id"
+            plugin_table["value_target.1"] = "step_id"
+            plugin_table.columns = [x if "value_target" not in x else "value_target" for x in plugin_table.columns ]
         else:
             plugin_table.loc[:, "value_target"] = "step_id"
         plugin_table.loc[:, "result_source"] = "qiime2"
-        plugin_table.loc[:, "analysis_id"] = "QIIME2 Run, " + latest_rundate.format("MMMM YYYY") + ", version %d.%d.%d" % (latest_qiime_year, latest_qiime_month, latest_qiime_minor)
-        plugin_table.loc[:, "analysis_date"] = latest_rundate.format("DD/MM/YYYY")
+#        plugin_table.loc[:, "analysis_id"] = "QIIME2 Run, " + latest_rundate.format("MMMM YYYY") + ", version %d.%d.%d" % (latest_qiime_year, latest_qiime_month, latest_qiime_minor)
+#        plugin_table.loc[:, "analysis_date"] = latest_rundate.format("DD/MM/YYYY")
         for idx, sample in enumerate(samples):
             if idx == 0:
                 new_field = "sample_id"
@@ -230,15 +294,13 @@ class q2Extractor(object):
             plugin_table.loc[:, new_field] = sample
         return plugin_table
 
-    def _add_parameters(self, current=True, upstream=False):
-        if len(self.value_dict) == 0:
-            self._init_value_table()
-        plugin_str, file_str = self.get_provenance(current, upstream)
-        param_table = pd.read_csv(io.StringIO(plugin_str), sep="\t")
-        self._add_value([ (param_table.loc[x]["step_parameter_id"],
-                           param_table.loc[x]["step_parameter_value"]) for x in param_table.index ],
-                        value_type="PA")
-                            
+    def get_result(self, *args, **kwargs):
+        return self.get_provenance(*args, **kwargs)
+
+    def get_samples(self):
+        if self.samples is None:
+            self.get_provenance()
+        return self.samples
 
     def get_format_by_uuid(self, uuid):
         xf = self.zfile.open(self.base_uuid + "/provenance/artifacts/" + uuid + "/metadata.yaml")
@@ -308,45 +370,56 @@ class q2Extractor(object):
    
     def _init_value_table(self):
         # Globally true settings for all artifacts
+        step = self.plugin + "__" + self.action 
         global_settings = {"result_id": self.base_uuid,
                            "result_type": self.type,
-                           "source_step_id": self.plugin,
-                           "source_step_method": self.action,
-                           "source_software": "qiime2",
-                           "replicate_id": np.nan,
-                           "feature_id": np.nan,
-                           "value_type": np.nan}
+                           "result_source": "qiime2",
+                           "step_id": step,
+                           "value_type": "metadata",
+                           "value_target": "result_id"}
         self.value_dict = {0: global_settings}
         self.valtab_index = 1
 
-    def _add_value(self, values, link_objs=[], value_type="ME"):
+    def _add_value(self, values, link_objs=[], value_type="measure"):
         #Duplicate the rows above
         self.value_dict[self.valtab_index] = copy.deepcopy(self.value_dict[0])
         for value_name, value in values:
             self.value_dict[self.valtab_index][value_name] = value
         for field_info in link_objs:
             field_name = field_info[0]
+            original_field = field_name
             suffidx = 1
-            if not pd.isna(self.value_dict[self.valtab_index][field_name]):
-                while (field_name in self.value_dict[self.valtab_index]):
-                    field_name = field_info[0] + ".%d" % (suffidx,)
-                    suffidx += 1
+            while (field_name in self.value_dict[self.valtab_index]):
+                field_name = field_info[0] + ".%d" % (suffidx,)
+                suffidx += 1
             self.value_dict[self.valtab_index][field_name] = field_info[1]
+            vfname = "value_target"
+            idx = 1
+            found=False
+            while vfname in self.value_dict[self.valtab_index]:
+                if self.value_dict[self.valtab_index][vfname] == original_field:
+                    found=True
+                    break
+                else:
+                    vfname = "value_target.%d" % (idx,)
+                    idx += 1
+            if not found:
+                self.value_dict[self.valtab_index][vfname] = original_field
         self.value_dict[self.valtab_index]["value_type"] = value_type
         self.valtab_index += 1
 
-    def extract_values(self):
+    def get_values(self):
         self._init_value_table()
-               # We need to add replicate ID and 
+               # We need to add sample ID and 
         if self.type == 'SampleData[DADA2Stats]':
             data = self.extract_data()
             for row in data.index:
-                rep = data.loc[row]['sample-id']
+                sample = data.loc[row]['sample-id']
                 index_names = ["input", "filtered","denoised","merged","non-chimeric"]
                 value_names = ["input_sequence_count", "filtered_sequence_count", "denoised_sequence_count", "merged_sequence_count", "nonchimeric_sequence_count"]
                 values = [data.loc[row][name] for name in index_names]
                 self._add_value(zip(value_names, values),
-                                [("replicate_id", rep)])
+                                [("sample_id", sample)])
         elif self.type == 'PCoAResults':
             data = self.extract_data()
             coords = data['coordinates']
@@ -354,32 +427,32 @@ class q2Extractor(object):
             # Set this to be variable?
             for x in coords.index:
                 self._add_value([("pcoa_coord_%d" % (pc,), coords.loc[x][pc]) for pc in [1,2,3]],
-                                [("replicate_id", x)])
-            self._add_value([("proportion_explained_pcoa_%d" % (pc,), prop_exp.loc["Proportion explained"][pc]) for pc in [1,2,3]])
+                                [("sample_id", x)])
+            self._add_value([("pcoa_proportion_explained_%d" % (pc,), prop_exp.loc["Proportion explained"][pc]) for pc in [1,2,3]])
         elif self.type == 'FeatureTable[Frequency]':
             table_data = self.extract_data()
             feature_names = table_data.index.tolist()
-            replicate_names = table_data.columns.tolist()
-            rep_abundances = table_data.sum()
+            sample_names = table_data.columns.tolist()
+            sample_abundances = table_data.sum()
             feature_abundances = table_data.sum(axis=1)
             total_sequences = table_data.sum().sum()
-            self._add_value([("table_sequence_count",
+            self._add_value([("sequence_count",
                             total_sequences)])
-            for rep, abund in zip(replicate_names, rep_abundances):
-                self._add_value([("replicate_sequence_count",abund)],
-                                [("replicate_id", rep)])
+            for sample, abund in zip(sample_names, sample_abundances):
+                self._add_value([("sequence_count",abund)],
+                                [("sample_id", sample)])
             for feat, abund in zip(feature_names, feature_abundances):
-                self._add_value([("feature_sequence_count",
+                self._add_value([("sequence_count",
                                 abund)],
                                 [("feature_id", feat)])
-            for rep in replicate_names:
+            for sample in sample_names:
                 for feat in feature_names:
-                    abund = table_data.loc[feat][rep]
+                    abund = table_data.loc[feat][sample]
                     if (abund > 0):
-                        self._add_value([("feature_replicate_count",
-                                    table_data.loc[feat][rep])],
+                        self._add_value([("sequence_count",
+                                    table_data.loc[feat][sample])],
                                     [("feature_id", feat),
-                                     ("replicate_id", rep)])
+                                     ("sample_id", sample)])
         elif self.type == 'FeatureData[Taxonomy]':
             data = []
             tax_data = self.extract_data()
@@ -387,14 +460,15 @@ class q2Extractor(object):
                 self._add_value([("taxonomic_classification",
                                   row['Taxon']),
                                  ("taxonomic_confidence",
-                                  row['Confidence'])],
+                                  row['Confidence']),
+                                 ("feature_annotation",
+                                  "taxonomic_classification")],
                                 [("feature_id",
                                   row['Feature ID'])])
         elif self.type == 'Phylogeny[Rooted]':
             data = self.extract_data()
             self._add_value([("newick_string", data.write())],
-                            [("replicate_id", x) for x in self.get_replicates()] + [("feature_id", x.name) for x in data.get_leaves()])
-        self._add_parameters()
+                            [("sample_id", x) for x in self.get_samples()] + [("feature_id", x.name) for x in data.get_leaves()])
         return pd.DataFrame.from_dict(self.value_dict, orient='index')
 
     def __str__(self):
