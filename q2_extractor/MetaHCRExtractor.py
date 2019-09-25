@@ -1,8 +1,8 @@
-from q2_extractor.Extractor import q2Extractor
+from q2_extractor.Extractor import Extractor
 
-class MetaHCRExtractor(q2Extractor):
+class MetaHCRExtractor(Extractor):
     def extract_data(self):
-        data = q2Extractor.extract_data(self)
+        data = Extractor.extract_data(self)
         if self.type=='SampleData[DADA2Stats]':
             data.rename(columns={'sample-id': 'sample_name',
                                  'input':'lib_size_before_quality_control',
@@ -30,11 +30,11 @@ class MetaHCRExtractor(q2Extractor):
             data[["kingdom","phylum","class",
                   "order","family","genus","species"]] = data['Taxon'].str.split("; ", expand=True)
             data.drop(labels=['Confidence', 'Taxon'], axis=1, inplace=True)
-        #Skip if the q2Extractor result doesn't need to be mangled
+        #Skip if the Extractor result doesn't need to be mangled
         elif self.type in ['PCoAResults']:
             pass
         else:
-            print("Warning: QIIME2 type '%s' not yet implemented, returning q2Extractor class results" % (self.type,))
+            print("Warning: QIIME2 type '%s' not yet implemented, returning Extractor class results" % (self.type,))
         return data
 
 def generate_SingleGeneAnalysis_table(taxonomy_artifact, table_artifact):
