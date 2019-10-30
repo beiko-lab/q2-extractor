@@ -3,10 +3,6 @@
 Main module for command-line interaction with q2-extractor
 """
 
-__author__ = "Michael Hall"
-__version__ = "0.1.0"
-__license__ = "MIT"
-
 import argparse
 
 import q2_extractor.Extractor as Extractor

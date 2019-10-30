@@ -2,6 +2,7 @@ import zipfile
 import yaml
 import re
 import io
+import os
 import pandas as pd
 import numpy as np
 from scipy.sparse import csr_matrix
@@ -12,6 +13,8 @@ import arrow
 import importlib
 import inspect
 import pkgutil
+
+from collections import defaultdict
 
 def scalar_constructor(loader, node):
     value = loader.construct_scalar(node)
@@ -89,11 +92,14 @@ class Extractor(object):
     """This class attempts to extract the useful information
     from a QIIME2 artifact file.
     """
-    def __init__(self, artifact_path):
+    def __init__(self, artifact_path_or_file):
         """
         """
-        self.filename = artifact_path
-        self.zfile = zipfile.ZipFile(artifact_path)
+        if isinstance(artifact_path_or_file, str): 
+            self.filename = artifact_path_or_file
+        else:
+            self.filename = artifact_path_or_file.name 
+        self.zfile = zipfile.ZipFile(artifact_path_or_file)
         self.infolist = self.zfile.infolist()
         self.base_uuid = base_uuid(self.infolist[0].filename)
         #First, hit up the lowest-level metadata.yaml
@@ -161,10 +167,9 @@ class Extractor(object):
                 if len(matches) >= 1:
                     actions.append("artifacts/" + matches[0])
         
-        file_str = "sample_id\tvalue_type\tsequence_filename\tsequence_md5sum\n"
         if current:
             actions = actions + ["action/action.yaml"]
-        samples = []
+        samples = defaultdict(dict)
         result_stream = {}
         for actionyaml in actions:
             if actionyaml != "action/action.yaml":
@@ -200,7 +205,7 @@ class Extractor(object):
                 action = yf['action']['action']
                 step = plugin_name + "__" + action 
                 if res_uuid not in result_stream:
-                    result_stream[res_uuid] = {"step_id": step}
+                    result_stream[res_uuid] = {"step_name": step}
                 for key, value in parameters:
                     if key not in result_stream[res_uuid]:
                         result_stream[res_uuid][key] = [value]
@@ -208,10 +213,10 @@ class Extractor(object):
                         result_stream[res_uuid][key].append(value)
                 for key, value in inputs:
                     if include_input:
-                        if "upstream_result" not in result_stream[res_uuid]:
-                            result_stream[res_uuid]["upstream_result"] = [value]
+                        if "result_upstream" not in result_stream[res_uuid]:
+                            result_stream[res_uuid]["result_upstream"] = [value]
                         else:
-                            result_stream[res_uuid]["upstream_result"].append(value)
+                            result_stream[res_uuid]["result_upstream"].append(value)
                         if key not in result_stream[res_uuid]:
                             result_stream[res_uuid][key] = [value]
                         else:
@@ -219,42 +224,42 @@ class Extractor(object):
                     else:
                         #Record the upstream step
                         upstream_uuid = value
-                        if "upstream_step" not in result_stream[res_uuid]:
-                            result_stream[res_uuid]["upstream_step"] = [upstream_uuid]
+                        if "step_upstream" not in result_stream[res_uuid]:
+                            result_stream[res_uuid]["step_upstream"] = [upstream_uuid]
                         else:
-                            result_stream[res_uuid]["upstream_step"].append(upstream_uuid)
+                            result_stream[res_uuid]["step_upstream"].append(upstream_uuid)
             #It is import item, so we grab the manifest
             else:
-                result_stream[res_uuid] = {"step_id": "qiime2_import"}
+                result_stream[res_uuid] = {"step_name": "qiime2_import"}
                 fname_md5sums = yf['action']['manifest']
                 filenames = [x['name'] for x in fname_md5sums]
                 #If this is a MANIFESTed, import, we can get the sample_ids from it
+                #NOTE: In most cases, this is the same as the sample-id in a QIIME2 analysis
+                # but might not be, if someone made a custom MANIFEST, in which case
+                # we have to scrape the values elsewhere?
                 if include_input:
                     if ("MANIFEST" in filenames) and ("metadata.yml" in filenames):
-                        samples = [x.split("_")[0] for x in filenames if x not in ["MANIFEST","metadata.yml"]]
-                        self.samples = samples
-                    for x in fname_md5sums:
-                        if "input_filename" not in result_stream[res_uuid]:
-                            result_stream[res_uuid]["input_filename"] = [x['name']]
-                        else:
-                            result_stream[res_uuid]["input_filename"].append(x['name'])
-                        if "input_filename_md5sum" not in result_stream[res_uuid]:
-                            result_stream[res_uuid]["input_filename_md5sum"] = [x['name']+": " + x['md5sum']]
-                        else:
-                            result_stream[res_uuid]["input_filename_md5sum"].append(x['name']+": "+x['md5sum'])
-        
+                        for x in fname_md5sums:
+                            name = x['name'].split("_")[0]
+                            if name not in ["MANIFEST", "metadata.yml"]:
+                                samples[name]["sample_name"] = x["name"].split("_")[0]
+                                samples[name]["input_filename"] = x["name"]
+                                samples[name]["input_md5sum"] = x["md5sum"]
+                                samples[name]["value_target"] = "sample"
+                                samples[name]["value_type"] = "metadata"
+                        self.samples = list(samples.keys())
             result_stream[res_uuid]["result_type"] = [result_type]
         parameter_names = []
         for res_uuid in result_stream:
-            if "upstream_step" in result_stream[res_uuid]:
-                upstream_uuids = result_stream[res_uuid]["upstream_step"]
+            if "step_upstream" in result_stream[res_uuid]:
+                upstream_uuids = result_stream[res_uuid]["step_upstream"]
                 upstream_steps = []
                 for upstream_uuid in upstream_uuids:
                     if (upstream_uuid in result_stream) and \
-                       ("step_id" in result_stream[upstream_uuid]) and \
-                       (result_stream[upstream_uuid]["step_id"] not in upstream_steps):
-                        upstream_steps.append(result_stream[upstream_uuid]["step_id"])
-                result_stream[res_uuid]["upstream_step"] = upstream_steps
+                       ("step_name" in result_stream[upstream_uuid]) and \
+                       (result_stream[upstream_uuid]["step_name"] not in upstream_steps):
+                        upstream_steps.append(result_stream[upstream_uuid]["step_name"])
+                result_stream[res_uuid]["step_upstream"] = upstream_steps
 
             initial_fields = list(result_stream[res_uuid].keys())
             for field in initial_fields:
@@ -275,23 +280,26 @@ class Extractor(object):
         parameter_names = np.unique(parameter_names)
         plugin_columns = ["result_source","value_type", "value_target"] + parameter_names.tolist()
         plugin_table = pd.DataFrame.from_dict(result_stream, columns=plugin_columns, orient='index')
-        plugin_table.index.name = "result_id"
+        plugin_table.index.name = "result_uuid"
         plugin_table.loc[:, "value_type"] = "parameter"
         if include_input:
-            plugin_table.loc[:, "value_target"] = "result_id"
-            plugin_table["value_target.1"] = "step_id"
-            plugin_table.columns = [x if "value_target" not in x else "value_target" for x in plugin_table.columns ]
+            plugin_table.loc[:, "value_target"] = "result"
+            plugin_table["value_target.1"] = "step"
         else:
-            plugin_table.loc[:, "value_target"] = "step_id"
+            plugin_table.loc[:, "value_target"] = "step"
         plugin_table.loc[:, "result_source"] = "qiime2"
 #        plugin_table.loc[:, "analysis_id"] = "QIIME2 Run, " + latest_rundate.format("MMMM YYYY") + ", version %d.%d.%d" % (latest_qiime_year, latest_qiime_month, latest_qiime_minor)
 #        plugin_table.loc[:, "analysis_date"] = latest_rundate.format("DD/MM/YYYY")
-        for idx, sample in enumerate(samples):
+        for idx, sample in enumerate(list(samples.keys())):
             if idx == 0:
-                new_field = "sample_id"
+                new_field = "sample_name"
             else:
-                new_field = "sample_id.%d" % (idx,)
+                new_field = "sample_name.%d" % (idx,)
             plugin_table.loc[:, new_field] = sample
+        plugin_table["result_uuid"] = plugin_table.index
+        plugin_table = plugin_table.reindex()
+        sample_table = pd.DataFrame.from_dict(samples, orient='index')
+        plugin_table = plugin_table.append(sample_table, ignore_index=True, sort=False)
         return plugin_table
 
     def get_result(self, *args, **kwargs):
@@ -371,12 +379,12 @@ class Extractor(object):
     def _init_value_table(self):
         # Globally true settings for all artifacts
         step = self.plugin + "__" + self.action 
-        global_settings = {"result_id": self.base_uuid,
+        global_settings = {"result_uuid": self.base_uuid,
                            "result_type": self.type,
                            "result_source": "qiime2",
-                           "step_id": step,
+                           "step_name": step,
                            "value_type": "metadata",
-                           "value_target": "result_id"}
+                           "value_target": "result"}
         self.value_dict = {0: global_settings}
         self.valtab_index = 1
 
@@ -397,14 +405,14 @@ class Extractor(object):
             idx = 1
             found=False
             while vfname in self.value_dict[self.valtab_index]:
-                if self.value_dict[self.valtab_index][vfname] == original_field:
+                if self.value_dict[self.valtab_index][vfname] == original_field.split("_")[0]:
                     found=True
                     break
                 else:
                     vfname = "value_target.%d" % (idx,)
                     idx += 1
             if not found:
-                self.value_dict[self.valtab_index][vfname] = original_field
+                self.value_dict[self.valtab_index][vfname] = original_field.split("_")[0]
         self.value_dict[self.valtab_index]["value_type"] = value_type
         self.valtab_index += 1
 
@@ -415,11 +423,15 @@ class Extractor(object):
             data = self.extract_data()
             for row in data.index:
                 sample = data.loc[row]['sample-id']
-                index_names = ["input", "filtered","denoised","merged","non-chimeric"]
-                value_names = ["input_sequence_count", "filtered_sequence_count", "denoised_sequence_count", "merged_sequence_count", "nonchimeric_sequence_count"]
+                index_names = ["input", "filtered","denoised","non-chimeric"]
+                value_names = ["input_sequence_count", "filtered_sequence_count", "denoised_sequence_count", "nonchimeric_sequence_count"]
+                # Above for denoise single, below for denoise paired
+                if "merged" in data.columns:
+                    index_names.append("merged")
+                    value_names.append("merged_sequence_count")
                 values = [data.loc[row][name] for name in index_names]
                 self._add_value(zip(value_names, values),
-                                [("sample_id", sample)])
+                                [("sample_name", sample)])
         elif self.type == 'PCoAResults':
             data = self.extract_data()
             coords = data['coordinates']
@@ -427,7 +439,7 @@ class Extractor(object):
             # Set this to be variable?
             for x in coords.index:
                 self._add_value([("pcoa_coord_%d" % (pc,), coords.loc[x][pc]) for pc in [1,2,3]],
-                                [("sample_id", x)])
+                                [("sample", x)])
             self._add_value([("pcoa_proportion_explained_%d" % (pc,), prop_exp.loc["Proportion explained"][pc]) for pc in [1,2,3]])
         elif self.type == 'FeatureTable[Frequency]':
             table_data = self.extract_data()
@@ -440,19 +452,19 @@ class Extractor(object):
                             total_sequences)])
             for sample, abund in zip(sample_names, sample_abundances):
                 self._add_value([("sequence_count",abund)],
-                                [("sample_id", sample)])
+                                [("sample_name", sample)])
             for feat, abund in zip(feature_names, feature_abundances):
                 self._add_value([("sequence_count",
                                 abund)],
-                                [("feature_id", feat)])
+                                [("feature_name", feat)])
             for sample in sample_names:
                 for feat in feature_names:
                     abund = table_data.loc[feat][sample]
                     if (abund > 0):
                         self._add_value([("sequence_count",
                                     table_data.loc[feat][sample])],
-                                    [("feature_id", feat),
-                                     ("sample_id", sample)])
+                                    [("feature_name", feat),
+                                     ("sample_name", sample)])
         elif self.type == 'FeatureData[Taxonomy]':
             data = []
             tax_data = self.extract_data()
@@ -461,14 +473,15 @@ class Extractor(object):
                                   row['Taxon']),
                                  ("taxonomic_confidence",
                                   row['Confidence']),
-                                 ("feature_annotation",
+                                 ("feature_annotations",
                                   "taxonomic_classification")],
-                                [("feature_id",
+                                [("feature_name",
                                   row['Feature ID'])])
         elif self.type == 'Phylogeny[Rooted]':
             data = self.extract_data()
             self._add_value([("newick_string", data.write())],
-                            [("sample_id", x) for x in self.get_samples()] + [("feature_id", x.name) for x in data.get_leaves()])
+                            [("sample_name", x) for x in self.get_samples()] + \
+                            [("feature_name", x.name) for x in data.get_leaves()])
         return pd.DataFrame.from_dict(self.value_dict, orient='index')
 
     def __str__(self):
