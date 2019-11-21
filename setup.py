@@ -13,7 +13,6 @@ from os import path
 # and accepts an argument to specify the text encoding
 # Python 3 only projects can skip this import
 from io import open
-import q2_extractor
 
 here = path.abspath(path.dirname(__file__))
 
@@ -44,7 +43,7 @@ setup(
     # For a discussion on single-sourcing the version across setup.py and the
     # project code, see
     # https://packaging.python.org/en/latest/single_source_version.html
-    version=q2_extractor.__version__,  # Required
+    version=0.2.0,  # Required
 
     # This is a one-line description or tagline of what your project does. This
     # corresponds to the "Summary" metadata field:

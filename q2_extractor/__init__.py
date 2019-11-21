@@ -3,8 +3,7 @@
 .. moduleauthor:: Michael Hall <mike.hall@dal.ca>
 """
 
-from q2_extractor import Extractor, MetaHCRExtractor
+from q2_extractor import Extractor, DirectoryInspector, MetaHCRExtractor
 
 __author__ = "Michael Hall"
-__version__ = "0.2.0"
 __license__ = "MIT"
